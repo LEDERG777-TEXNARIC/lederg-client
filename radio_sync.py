@@ -359,6 +359,61 @@ def _sync_generated_radio_icons(radio_root: Path, old_state: dict, active_statio
             generated.append({"station": station, "files": files})
     return generated
 
+
+
+def _archive_inactive_managed_station_dirs(
+    radio_root: Path,
+    old_state: dict,
+    active_stations: set[str],
+) -> list[str]:
+    managed = {}
+    for record in old_state.get("files", []):
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            continue
+        try:
+            station = _safe_repo_track_path(record["path"]).parts[0]
+        except ValueError:
+            continue
+        managed.setdefault(station.casefold(), station)
+    for record in old_state.get("generated_icons", []):
+        if not isinstance(record, dict) or not isinstance(record.get("station"), str):
+            continue
+        try:
+            station = _safe_repo_track_path(f"{record['station']}/placeholder.mp3").parts[0]
+        except ValueError:
+            continue
+        managed.setdefault(station.casefold(), station)
+
+    active_keys = {station.casefold() for station in active_stations}
+    archived = []
+    radio_root_resolved = radio_root.resolve()
+    backup_root = radio_root.parent / "radio-local-backup"
+    for station_key, station in sorted(managed.items(), key=lambda item: item[1].casefold()):
+        if station_key in active_keys:
+            continue
+        station_dir = radio_root / station
+        if not station_dir.is_dir() or station_dir.is_symlink():
+            continue
+        try:
+            station_dir.resolve().relative_to(radio_root_resolved)
+        except ValueError:
+            continue
+        try:
+            if not any(station_dir.iterdir()):
+                continue
+        except OSError:
+            continue
+
+        backup_root.mkdir(parents=True, exist_ok=True)
+        destination = backup_root / station
+        suffix = 2
+        while destination.exists():
+            destination = backup_root / f"{station} (archived {suffix})"
+            suffix += 1
+        shutil.move(str(station_dir), str(destination))
+        archived.append(destination.relative_to(radio_root.parent).as_posix())
+    return archived
+
 def _get_index(client_http, index_url: str) -> list[dict]:
     response = client_http.get(index_url, timeout=(10, 30))
     response.raise_for_status()
@@ -656,6 +711,7 @@ def sync_radio_repository(
 
     stations = sorted({item["station"] for item in tree}, key=str.casefold)
     generated_icons = _sync_generated_radio_icons(radio_root, old_state, set(stations))
+    archived_local_files = _archive_inactive_managed_station_dirs(radio_root, old_state, set(stations))
 
     for directory, subdirs, files in os.walk(radio_root, topdown=False):
         folder = Path(directory)
@@ -685,6 +741,7 @@ def sync_radio_repository(
         "downloaded": downloaded,
         "skipped": skipped,
         "removed": removed,
+        "archived_local_files": archived_local_files,
         "tracks": len(tree),
         "errors": [],
     }

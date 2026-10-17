@@ -198,8 +198,11 @@ class RadioSyncTests(unittest.TestCase):
         del RadioHTTPHandler.files["LEDERG FM/second.ogg"]
         result = self.sync()
         self.assertTrue(result["ok"])
-        self.assertTrue(personal.exists())
-        self.assertEqual(personal.read_text(encoding="utf-8"), "keep")
+        archived = self.game_root / "resound" / "radio-local-backup" / "LEDERG FM" / "local-note.txt"
+        self.assertFalse(personal.exists())
+        self.assertTrue(archived.exists())
+        self.assertEqual(archived.read_text(encoding="utf-8"), "keep")
+        self.assertIn("radio-local-backup/LEDERG FM", result["archived_local_files"])
 
     def test_invalid_path_from_remote_tree_is_rejected_without_pruning(self):
         self.sync()
