@@ -30,7 +30,7 @@ from client_updates import (
     inspect_installation,
     validate_manifest,
 )
-from radio_sync import sync_radio_repository
+from radio_sync import ensure_resound_runtime, sync_radio_repository
 
 APP_NAME = "LEDERG CR:MP"
 # Public config is intentionally separated from the launcher binary so server
@@ -1510,7 +1510,9 @@ class LedgerLauncher(tk.Tk):
                         self.status_text = "РАДИО НЕДОСТУПНО — ЗАПУСКАЮ LEDERG"
                     else:
                         radio_result = result.get("result", {})
-                        if radio_result.get("ok"):
+                        if radio_result.get("runtime_error"):
+                            self.status_text = "РАДИО НЕ ПОДКЛЮЧЕНО — МОД НЕ ЗАГРУЖЕН"
+                        elif radio_result.get("ok"):
                             station_count = len(radio_result.get("stations", []))
                             track_count = int(radio_result.get("tracks", 0))
                             self.status_text = f"РАДИО LEDERG: {station_count} СТАНЦИЙ / {track_count} ТРЕКОВ"
@@ -1648,11 +1650,21 @@ class LedgerLauncher(tk.Tk):
         return f"{value / (1024 ** 2):.0f} МБ"
 
     def _radio_sync_worker(self, game_root: Path) -> None:
+        runtime_error = ""
+        try:
+            runtime = ensure_resound_runtime(game_root)
+        except Exception as exc:
+            runtime = {"ok": False, "installed": False, "files": 0}
+            runtime_error = str(exc)
+
         try:
             result = sync_radio_repository(game_root)
+            result["runtime"] = runtime
+            if runtime_error:
+                result["runtime_error"] = runtime_error
             self.events.put(("radio_sync_done", {"result": result}))
         except Exception as exc:
-            self.events.put(("radio_sync_done", {"error": str(exc)}))
+            self.events.put(("radio_sync_done", {"error": str(exc), "runtime_error": runtime_error}))
 
     def play(self, _radio_synced: bool = False) -> None:
         client = self.client if self.client and self.client.is_file() else (

@@ -17,4 +17,4 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Run client update, radio sync and launcher tests
-        run: python -m unittest -v test_client_updates test_radio_sync test_folder_download test_launcher
+        run: python -m unittest -v test_client_updates test_radio_sync test_radio_runtime test_folder_download test_launcher

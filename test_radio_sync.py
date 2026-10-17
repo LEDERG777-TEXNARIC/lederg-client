@@ -24,6 +24,38 @@ class RadioHTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path == "/index":
+            stations = ["LEDERG CHILL", "LEDERG FM", "LEDERG RAP", "LEDERG ROCK"]
+            tracks = []
+            for relative, data in sorted(self.files.items()):
+                parts = relative.split("/")
+                if len(parts) != 2 or Path(parts[1]).suffix.casefold() not in {".mp3", ".ogg", ".wav"}:
+                    continue
+                tracks.append({
+                    "path": relative,
+                    "station": parts[0],
+                    "size": len(data),
+                    "sha": git_blob_sha(data),
+                })
+            canonical = {"stations": stations, "files": tracks}
+            fingerprint = hashlib.sha256(
+                json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            body = json.dumps({
+                "schema": 1,
+                "repository": "LEDERG777-TEXNARIC/LEDERG-radio-crmp",
+                "branch": "main",
+                "fingerprint": fingerprint,
+                "stations": stations,
+                "files": tracks,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/tree":
             tree = []
             for relative, data in sorted(self.files.items()):
@@ -106,6 +138,17 @@ class RadioSyncTests(unittest.TestCase):
             raw_base_url=self.base + "/raw/",
         )
 
+    def test_index_mode_syncs_tracks_without_calling_github_tree_api(self):
+        result = sync_radio_repository(
+            self.game_root,
+            http=requests.Session(),
+            index_url=self.base + "/index",
+            raw_base_url=self.base + "/raw/",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stations"], ["LEDERG FM", "LEDERG RAP"])
+        self.assertEqual((self.game_root / "resound" / "radio" / "LEDERG FM" / "first.mp3").read_bytes(), b"test-track-one")
+
     def test_station_folders_are_created_from_root_audio_folders(self):
         result = self.sync()
         self.assertTrue(result["ok"])
@@ -115,6 +158,18 @@ class RadioSyncTests(unittest.TestCase):
         self.assertEqual((root / "LEDERG FM" / "second.ogg").read_bytes(), b"test-track-two")
         self.assertEqual((root / "LEDERG RAP" / "rap.wav").read_bytes(), b"rap-track")
         self.assertFalse((root / "LEDERG ROCK").exists())
+
+    def test_active_station_gets_ledereg_png_icons(self):
+        result = self.sync()
+        self.assertTrue(result["ok"])
+        station = self.game_root / "resound" / "radio" / "LEDERG FM"
+        for filename in ("icon.png", "icon_round.png"):
+            icon = (station / filename).read_bytes()
+            self.assertTrue(icon.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual(int.from_bytes(icon[16:20], "big"), 128)
+            self.assertEqual(int.from_bytes(icon[20:24], "big"), 128)
+        state = json.loads((self.game_root / "resound" / ".lederg-radio-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(state["generated_icons"]), 2)
 
     def test_second_sync_skips_unchanged_files(self):
         first = self.sync()

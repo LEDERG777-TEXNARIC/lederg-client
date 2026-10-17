@@ -15,7 +15,7 @@ if ($RebuildDirectHelper) {
     if ($LASTEXITCODE -ne 0) { throw "Direct-launch helper compilation failed." }
 }
 
-& $Python -m unittest -v test_client_updates test_radio_sync test_folder_download test_launcher
+& $Python -m unittest -v test_client_updates test_radio_sync test_radio_runtime test_folder_download test_launcher
 if ($LASTEXITCODE -ne 0) { throw "Unit tests failed; refusing to build." }
 
 & $Python -m PyInstaller --noconfirm --clean "$Root\LEDERG CRMP.spec"
