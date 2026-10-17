@@ -23,6 +23,15 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
+from client_updates import (
+    STATE_FILENAME,
+    apply_successful_update,
+    fetch_files_manifest,
+    inspect_installation,
+    validate_manifest,
+)
+from radio_sync import sync_radio_repository
+
 APP_NAME = "LEDERG CR:MP"
 # Public config is intentionally separated from the launcher binary so server
 # addresses and client releases can be changed without rebuilding the EXE.
@@ -781,6 +790,7 @@ def download_client_folder(
     progress=None,
     cancel=None,
     http=None,
+    manifest_payload: dict | None = None,
 ) -> tuple[Path, int]:
     """
     Download a client as individual files into its install folder.
@@ -790,59 +800,26 @@ def download_client_folder(
     """
     client_http = http or HTTP
     try:
-        response = client_http.get(manifest_url, timeout=(15, 30))
-        response.raise_for_status()
-        payload = response.json()
+        payload = (
+            fetch_files_manifest(manifest_url, http=client_http)
+            if manifest_payload is None
+            else validate_manifest(manifest_payload)
+        )
+    except ValueError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"Не удалось получить манифест файлов клиента: {exc}") from exc
 
-    if not isinstance(payload, dict) or payload.get("schema") != 1:
-        raise ValueError("Неподдерживаемый формат манифеста файлов клиента.")
-    version = str(payload.get("version", "")).strip()
-    install_root_name = str(payload.get("install_root", "GTA Criminal Russia")).strip()
-    root_rel = PurePosixPath(install_root_name.replace("\\", "/"))
-    if (
-        not version
-        or not install_root_name
-        or root_rel.is_absolute()
-        or len(root_rel.parts) != 1
-        or root_rel.parts[0] in ("", ".", "..")
-        or ":" in root_rel.parts[0]
-    ):
-        raise ValueError("В манифесте указана некорректная папка установки.")
-    base_url = str(payload.get("files_base_url", "")).strip()
-    base_parsed = urlparse(base_url)
-    if base_parsed.scheme.lower() not in {"https", "http"} or not base_parsed.netloc:
-        raise ValueError("В манифесте указан некорректный files_base_url.")
-    if base_parsed.scheme.lower() == "http":
-        host = (base_parsed.hostname or "").lower()
-        if not (host.endswith(".cloudpub.ru") or host in {"localhost", "127.0.0.1", "::1"}):
-            raise ValueError("Незашифрованная загрузка разрешена только через Cloudpub или localhost.")
-
-    raw_files = payload.get("files")
-    if not isinstance(raw_files, list) or not raw_files:
-        raise ValueError("Манифест клиента не содержит файлов.")
-    files = []
-    seen = set()
-    for item in raw_files:
-        if not isinstance(item, dict):
-            raise ValueError("Некорректная запись файла в манифесте.")
-        relative = _safe_client_relative_path(item.get("path", ""))
-        key = relative.as_posix().casefold()
-        if key in seen:
-            raise ValueError(f"В манифесте повторяется путь: {relative.as_posix()}")
-        seen.add(key)
-        try:
-            size = int(item.get("size", -1))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Некорректный размер файла: {relative.as_posix()}") from exc
-        crc_text = str(item.get("crc32", "")).strip().lower().removeprefix("0x")
-        if size < 0 or not re.fullmatch(r"[0-9a-f]{8}", crc_text):
-            raise ValueError(f"Некорректный размер или CRC32: {relative.as_posix()}")
-        files.append((relative, size, int(crc_text, 16)))
-    total_bytes = sum(item[1] for item in files)
+    install_root_name = payload["install_root"]
+    root_rel = PurePosixPath(install_root_name)
+    base_url = payload["files_base_url"]
+    files = [
+        (PurePosixPath(item["path"]), item["size"], int(item["crc32"], 16))
+        for item in payload["files"]
+    ]
+    total_bytes = payload["total_bytes"]
     if total_bytes <= 0:
-        raise ValueError("Общий размер файлов клиента равен нулю.")
+        raise ValueError("Манифест клиента не содержит файлов для загрузки.")
 
     destination.mkdir(parents=True, exist_ok=True)
     install_root = (destination / root_rel.parts[0]).resolve()
@@ -1058,6 +1035,8 @@ class LedgerLauncher(tk.Tk):
         self.launcher_pid: int | None = None
         self.launch_monitor_attempts = 0
         self.game_poll_id = None
+        self._radio_sync_running = False
+        self._pending_play_after_radio = False
         self.launch_mode = DEFAULT_LAUNCH_MODE
         self.destination: Path | None = None
         try:
@@ -1068,9 +1047,20 @@ class LedgerLauncher(tk.Tk):
         except OSError:
             pass
         self.client: Path | None = find_client(self.destination) if self.destination else None
+        self.release_version = "unknown"
+        self.update_available = False
+        self.update_fingerprint = ""
+        self._update_check_running = False
+        self._update_prompt_open = False
+        self.update_preferences_file = base / "update_preferences.json"
+        try:
+            update_preferences = json.loads(self.update_preferences_file.read_text(encoding="utf-8"))
+            self.ignored_update_fingerprint = str(update_preferences.get("ignored_fingerprint", ""))
+        except (OSError, ValueError, TypeError):
+            self.ignored_update_fingerprint = ""
         self.status_text = (
-            "КЛИЕНТ НАЙДЕН — МОЖНО ЗАПУСКАТЬ"
-            if self.client else "ВЫБЕРИ ПАПКУ И УСТАНОВИ КЛИЕНТ"
+            "КЛИЕНТ НАЙДЕН — ПРОВЕРЯЮ ОБНОВЛЕНИЯ"
+            if self.client else "ВЫБЕРИ ПАПКУ И УСТАНОВИ LEDERG"
         )
         self.progress = 100.0 if self.client else 0.0
         self.progress_label = "ГОТОВО" if self.client else "ОЖИДАНИЕ"
@@ -1087,6 +1077,70 @@ class LedgerLauncher(tk.Tk):
         self.canvas.tag_bind("button", "<Leave>", lambda _e: self.canvas.configure(cursor=""))
         self.after(100, self.draw)
         self.after(100, self._poll_events)
+        self.after(1800, self._start_update_check)
+        self.after(60_000, self._periodic_update_check)
+
+    def _periodic_update_check(self) -> None:
+        self._start_update_check()
+        self.after(60_000, self._periodic_update_check)
+
+    def _start_update_check(self) -> None:
+        if self._update_check_running or self.busy:
+            return
+        client = self.client if self.client and self.client.is_file() else (
+            find_client(self.destination) if self.destination else None
+        )
+        if not client:
+            return
+        root = game_root_for(client)
+        ignored = self.ignored_update_fingerprint
+        self._update_check_running = True
+        threading.Thread(
+            target=self._update_check_worker,
+            args=(root, ignored),
+            daemon=True,
+            name="LEDERG-update-check",
+        ).start()
+
+    def _update_check_worker(self, install_root: Path, ignored_fingerprint: str) -> None:
+        try:
+            try:
+                release = fetch_release_manifest()
+                manifest_url = release.get("files_manifest_url") or CLIENT_FILES_MANIFEST_URL
+            except Exception:
+                manifest_url = CLIENT_FILES_MANIFEST_URL
+            manifest = fetch_files_manifest(manifest_url, http=HTTP)
+            fingerprint = manifest["fingerprint"]
+            if fingerprint == ignored_fingerprint:
+                self.events.put(("update_check_done", {
+                    "fingerprint": fingerprint,
+                    "version": manifest["version"],
+                    "available": True,
+                    "ignored": True,
+                }))
+                return
+            report = inspect_installation(install_root, manifest)
+            self.events.put(("update_check_done", {
+                "fingerprint": fingerprint,
+                "version": manifest["version"],
+                "available": report["update_available"],
+                "missing": len(report["missing"]),
+                "changed": len(report["changed"]),
+                "removed": len(report["removed"]),
+                "ignored": False,
+            }))
+        except Exception as exc:
+            self.events.put(("update_check_done", {"error": str(exc)}))
+
+    def _save_ignored_update_fingerprint(self, fingerprint: str) -> None:
+        self.ignored_update_fingerprint = fingerprint
+        try:
+            self.update_preferences_file.write_text(
+                json.dumps({"ignored_fingerprint": fingerprint}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def _save_nickname(self, _event=None) -> str:
         nickname = sanitize_nickname(self.nickname_var.get())
@@ -1201,8 +1255,8 @@ class LedgerLauncher(tk.Tk):
 
         accent_y = h - 130
         c.create_line(left_x, accent_y, left_x + 52, accent_y, fill=RED, width=3)
-        self._text(left_x, accent_y + 20, "АВТОПОДГОТОВКА КЛИЕНТА", 8, WHITE, True)
-        self._text(left_x, accent_y + 40, "Проверка архива и распаковка файлов", 8, MUTED)
+        self._text(left_x, accent_y + 20, "АВТООБНОВЛЕНИЕ LEDERG", 8, WHITE, True)
+        self._text(left_x, accent_y + 40, "Проверка изменений и докачка файлов", 8, MUTED)
 
         # Right: a single clear installation/launch flow.
         rx = int(w * 0.55)
@@ -1221,16 +1275,18 @@ class LedgerLauncher(tk.Tk):
         self._text(rx, 307, "ЗАПУСК", 8, MUTED, True)
         if self.busy:
             button_text, button_tag = "ОСТАНОВИТЬ ЗАГРУЗКУ", "cancel"
+        elif self.update_available:
+            button_text, button_tag = "↻   ОБНОВИТЬ LEDERG", "primary"
         elif self.client and self.client.is_file():
             button_text, button_tag = "▶   ЗАПУСТИТЬ LEDERG", "primary"
         else:
-            button_text, button_tag = "↓   СКАЧАТЬ И УСТАНОВИТЬ", "primary"
+            button_text, button_tag = "↓   СКАЧАТЬ LEDERG", "primary"
         self._pill_button(rx, 330, min(370, rw), 58, button_text, button_tag, True)
 
         if self.client and self.client.is_file() and not self.busy:
             self._pill_button(rx, 401, min(250, rw), 34, "ПЕРЕУСТАНОВИТЬ КЛИЕНТ", "reinstall", False)
         else:
-            self._text(rx, 406, "ZIP  /  RESUME  /  INTEGRITY CHECK", 7, MUTED2, True)
+            self._text(rx, 406, "FILES  /  RESUME  /  CRC32 VERIFY", 7, MUTED2, True)
 
         base_y = max(480, h - 190)
         c.create_line(rx, base_y - 22, w - 56, base_y - 22, fill="#1d1d1d", width=1)
@@ -1304,6 +1360,9 @@ class LedgerLauncher(tk.Tk):
     def primary_action(self, _event=None) -> None:
         if self.busy:
             return
+        if self.update_available:
+            self.start_install()
+            return
         if self.client and self.client.is_file():
             self.play()
             return
@@ -1323,6 +1382,17 @@ class LedgerLauncher(tk.Tk):
 
     def start_install(self) -> None:
         if self.busy:
+            return
+        game_running = (
+            (self.game_pid is not None and is_process_running(self.game_pid))
+            or (self.game_process is not None and self.game_process.poll() is None)
+        )
+        if game_running:
+            messagebox.showwarning(
+                APP_NAME,
+                "Сначала закрой игру. LEDERG нельзя безопасно обновлять, пока игровой клиент запущен.",
+                parent=self,
+            )
             return
         if not self.destination:
             self.choose_destination(start_install=True)
@@ -1366,8 +1436,13 @@ class LedgerLauncher(tk.Tk):
             self.events.put(("status", f"Скачиваю клиент LEDERG {release['version']}…"))
             count = 0
             archive = None
+            installed_manifest = None
             if release.get("files_manifest_url"):
-                self.events.put(("phase", "download", "СКАЧИВАЮ ФАЙЛЫ В ПАПКУ…", "GTA Criminal Russia/"))
+                installed_manifest = fetch_files_manifest(release["files_manifest_url"], http=HTTP)
+                self.events.put((
+                    "phase", "download", "СКАЧИВАЮ ОБНОВЛЁННЫЕ ФАЙЛЫ…",
+                    "GTA Criminal Russia/"
+                ))
                 _install_root, count = download_client_folder(
                     destination,
                     release["files_manifest_url"],
@@ -1375,6 +1450,7 @@ class LedgerLauncher(tk.Tk):
                         ("progress", phase, done, total, label)
                     ),
                     cancel=self.cancel_event,
+                    manifest_payload=installed_manifest,
                 )
             else:
                 archive = download_archive(
@@ -1409,9 +1485,12 @@ class LedgerLauncher(tk.Tk):
                     "Проверь, что папка содержит multiplayer_c/multiplayer_browser_cr.exe "
                     "либо совместимый CR:MP-клиент."
                 )
+            if installed_manifest is not None:
+                apply_successful_update(game_root_for(client), installed_manifest)
             if archive is not None:
                 archive.unlink(missing_ok=True)
-            self.events.put(("installed", str(client), count, release.get("version", "unknown"), release.get("launch_mode", DEFAULT_LAUNCH_MODE)))
+            final_version = installed_manifest["version"] if installed_manifest else release.get("version", "unknown")
+            self.events.put(("installed", str(client), count, final_version, release.get("launch_mode", DEFAULT_LAUNCH_MODE)))
         except InterruptedError as exc:
             self.events.put(("cancelled", str(exc)))
         except Exception as exc:
@@ -1422,7 +1501,77 @@ class LedgerLauncher(tk.Tk):
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
-                if kind == "status":
+                if kind == "radio_sync_done":
+                    self._radio_sync_running = False
+                    should_play = self._pending_play_after_radio
+                    self._pending_play_after_radio = False
+                    result = event[1]
+                    if result.get("error"):
+                        self.status_text = "РАДИО НЕДОСТУПНО — ЗАПУСКАЮ LEDERG"
+                    else:
+                        radio_result = result.get("result", {})
+                        if radio_result.get("ok"):
+                            station_count = len(radio_result.get("stations", []))
+                            track_count = int(radio_result.get("tracks", 0))
+                            self.status_text = f"РАДИО LEDERG: {station_count} СТАНЦИЙ / {track_count} ТРЕКОВ"
+                        else:
+                            self.status_text = "РАДИО НЕ ОБНОВЛЕНО — ИСПОЛЬЗУЮ ТЕКУЩИЕ ТРЕКИ"
+                    self.draw()
+                    if should_play:
+                        self.after(100, lambda: self.play(_radio_synced=True))
+                    continue
+                elif kind == "update_check_done":
+                    self._update_check_running = False
+                    result = event[1]
+                    if result.get("error"):
+                        if self.client and not self.busy:
+                            self.status_text = "КЛИЕНТ НАЙДЕН — ПРОВЕРКА ОБНОВЛЕНИЙ НЕДОСТУПНА"
+                    else:
+                        fingerprint = str(result.get("fingerprint", ""))
+                        version = str(result.get("version", "unknown"))
+                        self.update_fingerprint = fingerprint
+                        self.release_version = version
+                        if result.get("available"):
+                            self.update_available = True
+                            if result.get("ignored"):
+                                self.status_text = "ОБНОВЛЕНИЕ ДОСТУПНО — НАЖМИ «ОБНОВИТЬ LEDERG»"
+                            else:
+                                game_running = (
+                                    (self.game_pid is not None and is_process_running(self.game_pid))
+                                    or (self.game_process is not None and self.game_process.poll() is None)
+                                )
+                                if game_running:
+                                    self.status_text = "ОБНОВЛЕНИЕ ДОСТУПНО — ЗАКРОЙ ИГРУ"
+                                elif not self._update_prompt_open:
+                                    self._update_prompt_open = True
+                                    self.status_text = f"ДОСТУПНО ОБНОВЛЕНИЕ LEDERG {version}"
+                                    self.draw()
+                                    changes = []
+                                    if result.get("missing"):
+                                        changes.append(f"Новых или отсутствующих файлов: {result['missing']}")
+                                    if result.get("changed"):
+                                        changes.append(f"Изменённых файлов: {result['changed']}")
+                                    if result.get("removed"):
+                                        changes.append(f"Устаревших файлов к удалению: {result['removed']}")
+                                    detail = "\n".join(changes) or "Состав клиента изменился."
+                                    accepted = messagebox.askyesno(
+                                        "Обновление LEDERG",
+                                        f"Доступно обновление клиента LEDERG CR:MP.\n\n"
+                                        f"Версия: {version}\n{detail}\n\n"
+                                        "Скачать изменённые файлы и обновить клиент сейчас?",
+                                        parent=self,
+                                    )
+                                    self._update_prompt_open = False
+                                    if accepted:
+                                        self.start_install()
+                                    else:
+                                        self._save_ignored_update_fingerprint(fingerprint)
+                                        self.status_text = "ОБНОВЛЕНИЕ ДОСТУПНО — НАЖМИ «ОБНОВИТЬ LEDERG»"
+                        else:
+                            self.update_available = False
+                            if self.client and not self.busy:
+                                self.status_text = f"КЛИЕНТ LEDERG АКТУАЛЕН · {version}"
+                elif kind == "status":
                     self.status_text = event[1]
                 elif kind == "phase":
                     self.phase, self.status_text, self.current_file = event[1:]
@@ -1438,7 +1587,7 @@ class LedgerLauncher(tk.Tk):
                             f"СКАЧАНО {self._bytes(done)} / {self._bytes(total)}"
                             if total else f"СКАЧАНО {self._bytes(done)}"
                         )
-                        self.status_text = "СКАЧИВАНИЕ АРХИВА"
+                        self.status_text = "СКАЧИВАЮ ФАЙЛЫ LEDERG"
                     elif phase == "extract":
                         self.progress_label = (
                             f"РАСПАКОВАНО {self._bytes(done)} / {self._bytes(total)}"
@@ -1451,7 +1600,10 @@ class LedgerLauncher(tk.Tk):
                     self.client = Path(event[1])
                     self.release_version = event[3] if len(event) > 3 else "unknown"
                     self.launch_mode = event[4] if len(event) > 4 else DEFAULT_LAUNCH_MODE
-                    self.status_text = "УСТАНОВКА ЗАВЕРШЕНА — МОЖНО ИГРАТЬ"
+                    self.update_available = False
+                    self.update_fingerprint = ""
+                    self._save_ignored_update_fingerprint("")
+                    self.status_text = "КЛИЕНТ ОБНОВЛЁН — МОЖНО ИГРАТЬ"
                     self.progress = 100.0
                     self.progress_label = "ГОТОВО"
                     self.phase = "ready"
@@ -1467,13 +1619,19 @@ class LedgerLauncher(tk.Tk):
                 elif kind == "cancelled":
                     self.busy = False
                     self.phase = "paused"
-                    self.status_text = "ПРИОСТАНОВЛЕНО — ПРОГРЕСС СОХРАНЁН"
+                    self.status_text = (
+                        "ОБНОВЛЕНИЕ ПРИОСТАНОВЛЕНО — МОЖНО ПРОДОЛЖИТЬ"
+                        if self.update_available else "ПРИОСТАНОВЛЕНО — ПРОГРЕСС СОХРАНЁН"
+                    )
                     self.progress_label = "МОЖНО ПРОДОЛЖИТЬ"
                     self.current_file = ""
                 elif kind == "error":
                     self.busy = False
                     self.phase = "error"
-                    self.status_text = "УСТАНОВКА НЕ ЗАВЕРШЕНА"
+                    self.status_text = (
+                        "ОБНОВЛЕНИЕ НЕ ЗАВЕРШЕНО — ПОВТОРИ ПОЗЖЕ"
+                        if self.update_available else "УСТАНОВКА НЕ ЗАВЕРШЕНА"
+                    )
                     self.current_file = ""
                     messagebox.showerror(APP_NAME, event[1], parent=self)
                 self.draw()
@@ -1489,7 +1647,14 @@ class LedgerLauncher(tk.Tk):
             return f"{value / (1024 ** 3):.2f} ГБ"
         return f"{value / (1024 ** 2):.0f} МБ"
 
-    def play(self) -> None:
+    def _radio_sync_worker(self, game_root: Path) -> None:
+        try:
+            result = sync_radio_repository(game_root)
+            self.events.put(("radio_sync_done", {"result": result}))
+        except Exception as exc:
+            self.events.put(("radio_sync_done", {"error": str(exc)}))
+
+    def play(self, _radio_synced: bool = False) -> None:
         client = self.client if self.client and self.client.is_file() else (
             find_client(self.destination) if self.destination else None
         )
@@ -1507,6 +1672,24 @@ class LedgerLauncher(tk.Tk):
         if self.game_process is not None and self.game_pid is None and self.launch_monitor_attempts < 20:
             self.status_text = "ПРОВЕРЯЮ ЗАПУСК ИГРЫ..."
             self.draw()
+            return
+        if not _radio_synced:
+            if self._radio_sync_running:
+                self._pending_play_after_radio = True
+                self.status_text = "СИНХРОНИЗИРУЮ РАДИО LEDERG..."
+                self.draw()
+                return
+            self._radio_sync_running = True
+            self._pending_play_after_radio = True
+            self.status_text = "ПРОВЕРЯЮ РАДИОСТАНЦИИ LEDERG..."
+            self.current_file = "LEDERG-radio-crmp"
+            self.draw()
+            threading.Thread(
+                target=self._radio_sync_worker,
+                args=(game_root_for(client),),
+                daemon=True,
+                name="LEDERG-radio-sync",
+            ).start()
             return
         try:
             nickname = self._save_nickname()
